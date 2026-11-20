@@ -13,7 +13,7 @@ export function createMap(container, { mobile }) {
     container,
     attributionControl: { compact: true },
     center: mobile ? OVERVIEW.center : [78.5, 22.5],
-    zoom: mobile ? 11.6 : 2.2,
+    zoom: mobile ? OVERVIEW.zoom - 0.8 : 2.2,
     pitch: mobile ? 45 : 0,
     bearing: 0,
     maxPitch: 70,

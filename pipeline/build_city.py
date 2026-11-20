@@ -7,7 +7,7 @@ import math
 import pathlib
 import re
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 import csv
 import statistics
@@ -23,8 +23,11 @@ OUT = ROOT / "out"
 WEB = ROOT.parent / "web" / "public" / "data"
 GENERIC = {"the", "of", "at", "in", "sector", "gurgaon", "gurugram", "residency", "residences", "homes",
            "apartments", "apartment", "towers", "tower", "heights", "city", "phase", "park", "estate",
-           "floors", "society", "cghs", "group", "housing", "and", "by", "new", "greens", "green", "plaza"}
+           "floors", "society", "cghs", "group", "housing", "and", "by", "new", "greens", "green", "plaza",
+           "bangalore", "bengaluru", "layout", "nagar", "road", "main", "cross", "block", "stage", "enclave"}
 TOWER_H = 55.0  # visual default height (m) for generated apartment towers; shapes are not data
+STANDIN_R = 32.0        # radius (m) of the stand-in site drawn for a society spread off a shared locality pin
+STANDIN_SPACING = 80.0  # metres between those stand-in sites, so they never overlap
 
 
 def tokens(name):
@@ -88,8 +91,12 @@ class Grid:
                 yield from self.cells.get((cx + dx, cy + dy), [])
 
 
-def match_area(project, area_grid):
-    """OSM named area that contains the project point, or a name-matching one within 300 m."""
+def match_area(project, area_grid, inside_only_max=250_000):
+    """OSM named area that contains the project point, or a name-matching one within 300 m.
+
+    inside_only_max caps areas claimed only because the point falls inside them (no shared name):
+    a small project inside a big named layout should not take the whole layout as its site.
+    """
     pt = (project["lng"], project["lat"])
     pt_tokens = tokens(project["name"])
     best, best_score = None, 0
@@ -104,8 +111,9 @@ def match_area(project, area_grid):
             continue
         # skip neighbourhood-sized areas (whole sectors, DLF phases) unless the project itself is that big
         size = geo.area_m2(ring)
-        limit = max(250_000, 3 * (project.get("acres") or 0) * 4047)
-        if size > limit:
+        acres = project.get("acres") or 0
+        own = 3 * (acres if acres < 200 else 0) * 4047  # 200+ acres on a portal card is a typo, not a township
+        if size > max(250_000, own) or (not shared and size > max(inside_only_max, own)):
             continue
         score = shared * 10 + (5 if inside else 0) - d / 100
         if score > best_score:
@@ -115,15 +123,16 @@ def match_area(project, area_grid):
 
 def dedupe(projects):
     """Merge listings with the same name tokens less than 400 m apart (phases, duplicates)."""
-    kept = []
+    kept, by_key = [], defaultdict(list)  # bucket by name tokens: comparing every pair is too slow for a big city
     for p in projects:
-        for q in kept:
-            if tokens(p["name"]) == tokens(q["name"]) and tokens(p["name"]) and \
-                    geo.dist_m((p["lng"], p["lat"]), (q["lng"], q["lat"])) < 400:
-                q.setdefault("merged", []).append(p["url"])
-                break
+        key = frozenset(tokens(p["name"]))
+        hit = next((q for q in by_key[key] if geo.dist_m((p["lng"], p["lat"]), (q["lng"], q["lat"])) < 400), None) if key else None
+        if hit:
+            hit.setdefault("merged", []).append(p["url"])
         else:
             kept.append(p)
+            if key:
+                by_key[key].append(p)
     return kept
 
 
@@ -141,12 +150,13 @@ def norm(name):
 
 
 def match_verified(v, projects, taken=()):
-    """Portal project for a verified society: a match name must appear whole in the portal name, same sector if known."""
+    """Portal project for a verified society: a match name must appear whole in the portal name, same locality or sector if known."""
     best = None
     for p in projects:
         if p["mb_id"] in taken:
             continue
-        if v.get("sector") and not re.search(rf"\b{v['sector']}\b", p.get("locality") or ""):
+        want = v.get("locality") or v.get("sector")
+        if want and not re.search(rf"\b{re.escape(str(want))}\b", p.get("locality") or "", re.I):
             continue
         n = f" {norm(p['name'])} "
         if any(f" {norm(m)} " in n for m in v["match"]):
@@ -155,11 +165,11 @@ def match_verified(v, projects, taken=()):
     return best
 
 
-def events_for(s):
+def events_for(s, city_name="Gurgaon"):
     ev = []
     sid = s["id"]
     src = s.get("url")
-    ev.append({"sid": sid, "step": "Located on map", "finding": f"{s['locality'] or 'Gurgaon'} · {s['lat']:.4f}, {s['lng']:.4f}", "url": src})
+    ev.append({"sid": sid, "step": "Located on map", "finding": f"{s['locality'] or city_name} · {s['lat']:.4f}, {s['lng']:.4f}", "url": src})
     bits = [f"{int(s['towers'])} towers" if s.get("towers") else None, f"{int(s['units']):,} units" if s.get("units") else None,
             f"{s['acres']} acres" if s.get("acres") else None]
     if any(bits):
@@ -208,6 +218,9 @@ def shapes_for(s, area, bld_grid, sid_seed):
                 feats.append({"type": "Feature", "properties": {"sid": s["id"], "role": "bld", "h": h, "shape": "osm"}, "geometry": b["geometry"]})
             return feats, "osm"
         site, shape = ring, "osm-site"
+    elif s.get("at"):  # spread off a shared locality pin: the real site is unknown, so draw a small stand-in
+        site, shape = geo.circle(tuple(s["at"]), STANDIN_R), "generated"
+        feats.append({"type": "Feature", "properties": {"sid": s["id"], "role": "site"}, "geometry": {"type": "Polygon", "coordinates": [site]}})
     else:
         r = math.sqrt((s.get("acres") or 3) * 4047 / math.pi) if (s.get("acres") or 0) < 200 else 120
         site, shape = geo.circle((s["lng"], s["lat"]), max(40, min(r, 400))), "generated"
@@ -215,6 +228,8 @@ def shapes_for(s, area, bld_grid, sid_seed):
     if s["kind"] == "plot":
         return feats, shape
     n = int(s.get("towers") or 0) or (max(2, min(12, round((s.get("units") or 300) / 120))) if is_tall else 8)
+    if s.get("at") and not area:
+        n = min(n, 3 if is_tall else 4)  # a stand-in site has room for a few towers only
     w, d = (24, 18) if is_tall else (12, 10)
     for t in geo.generate_towers(site, n, seed=sid_seed, w_m=w, d_m=d):
         feats.append({"type": "Feature", "properties": {"sid": s["id"], "role": "bld", "h": TOWER_H if is_tall else 10.0, "shape": "generated"},
@@ -222,16 +237,106 @@ def shapes_for(s, area, bld_grid, sid_seed):
     return feats, shape
 
 
-def main(city="gurgaon"):
+def has_facts(p):
+    """False for a bare portal stub: a name and a pin, with no units, towers, price, rating or listings."""
+    return bool(p.get("units") or p.get("towers") or p.get("price_min") or p.get("rating") or p.get("sale_count") or p.get("rent_count")
+                or p.get("sale_listings") or p.get("rent_listings") or p.get("card_units") or (p.get("configs") or {}).get("units"))
+
+
+def flag_shared_points(societies, min_shared=5):
+    """Mark societies whose pin is one many others share: the portal's centre of the locality, not the site.
+
+    Two or three on one point can be phases of one project. Five or more with different names is the portal
+    falling back to a locality-level pin, so the map position and the nearby distances are only approximate.
+    Returns how many were marked.
+    """
+    here = Counter((s["lat"], s["lng"]) for s in societies)
+    n = 0
+    for s in societies:
+        if here[(s["lat"], s["lng"])] >= min_shared:
+            s["loc_shared"] = here[(s["lat"], s["lng"])]
+            n += 1
+    return n
+
+
+def score(s):
+    """Flat Finder score (0-10) and its parts: residents' rating 50%, what is nearby 30%, amenities 20%.
+
+    A part that is not known is left out and the rest rescaled: no ratings yet, or no place of its own
+    (a shared locality pin not found in OpenStreetMap, whose nearby distances are the pin's, not the society's).
+    With nothing known at all the score is None.
+    """
+    parts = {}
+    if s.get("rating"):
+        parts["residents"] = round(s["rating"] * 2, 1)
+    if not s.get("loc_shared") or s.get("osm_area"):  # same rule as nearbyKnown in web/src/filters.js
+        nb = s["nearby"]
+        reach = [nb.get("park", {}).get("m", 9e9) <= 500, nb.get("metro", {}).get("m", 9e9) <= 1500 or nb.get("rail", {}).get("m", 9e9) <= 1500,
+                 nb.get("school", {}).get("m", 9e9) <= 1000, nb.get("hospital", {}).get("m", 9e9) <= 2000, nb.get("shopping", {}).get("m", 9e9) <= 1500]
+        parts["nearby"] = round(10 * sum(reach) / len(reach), 1)
+    if not parts and not s["amenities"]:
+        return None, {}  # no ratings, no place of its own, no amenities listed: nothing to score, and 0 would read as a verdict
+    parts["amenities"] = round(min(10, len(s["amenities"]) / 3), 1)
+    w = {"residents": 0.5, "nearby": 0.3, "amenities": 0.2}
+    tot = sum(w[k] for k in parts)
+    return round(sum(parts[k] * w[k] for k in parts) / tot, 1), parts
+
+
+def hex_spiral(n):
+    """First n cells of a honeycomb, centre first then ring by ring, as (x, y) in units of the cell spacing."""
+    out = [(0.0, 0.0)]
+    k = 1
+    while len(out) < n:
+        q, r = -k, k  # axial coordinates: walk the six sides of ring k
+        for dq, dr in ((1, 0), (1, -1), (0, -1), (-1, 0), (-1, 1), (0, 1)):
+            for _ in range(k):
+                out.append((q + r / 2, r * math.sqrt(3) / 2))
+                q, r = q + dq, r + dr
+        k += 1
+    return out[:n]
+
+
+def spread_shared_points(societies, spacing_m=STANDIN_SPACING):
+    """Give each society stacked on a shared pin its own spot to be drawn and clicked: s["at"] = [lng, lat].
+
+    The spots form a honeycomb around the pin, the society with the most units in the middle. They are a
+    drawing aid only: lat, lng and the nearby distances stay the portal's. Returns how many were placed.
+    """
+    stacks = defaultdict(list)
+    for s in societies:
+        stacks[(s["lat"], s["lng"])].append(s)
+    n = 0
+    for (lat, lng), stack in stacks.items():
+        stack.sort(key=lambda s: (-(s.get("units") or 0), s["id"]))
+        for s, (x, y) in zip(stack, hex_spiral(len(stack))):
+            s["at"] = [round(lng + x * spacing_m / geo.m_per_deg_lng(lat), 6), round(lat + y * spacing_m / geo.M_PER_DEG_LAT, 6)]
+            n += 1
+    return n
+
+
+def main(city):
     cfg = json.loads((ROOT.parent / "data" / "cities.json").read_text())[city]
     out = OUT / city
     raw = json.loads((out / "mb_projects.json").read_text())
-    located = [p for p in raw if p.get("lat") and p.get("lng") and 28.2 < p["lat"] < 28.7 and 76.7 < p["lng"] < 77.3]
+    s0, w0, n0, e0 = cfg.get("located_bbox") or cfg["bbox"]  # south, west, north, east
+    located = [p for p in raw if p.get("lat") and p.get("lng") and s0 < p["lat"] < n0 and w0 < p["lng"] < e0]
     not_located = len(raw) - len(located)
+    stubs_dropped = 0
+    if cfg.get("drop_stubs"):
+        kept = [p for p in located if has_facts(p)]
+        stubs_dropped, located = len(located) - len(kept), kept
     projects = dedupe(located)
-    areas = json.loads((out / "osm_areas.geojson").read_text())["features"]
+
+    def feats(name):
+        f = out / name
+        if not f.exists():
+            print(f"missing {f.name}: run osm_fetch.py {city} (continuing without it)")
+            return []
+        return json.loads(f.read_text())["features"]
+
+    areas = feats("osm_areas.geojson")
     area_grid = Grid(areas, lambda a: geo.centroid(a["geometry"]["coordinates"][0]))
-    blds = json.loads((out / "osm_buildings.geojson").read_text())["features"]
+    blds = feats("osm_buildings.geojson")
     for b in blds:
         b["_c"] = geo.centroid(b["geometry"]["coordinates"][0])
     bld_grid = Grid(blds, lambda b: b["_c"])
@@ -369,12 +474,32 @@ def main(city="gurgaon"):
                 if lb:
                     u["est_short"], u["est_area"] = lb
 
+    approx_location = flag_shared_points(societies)
+
+    # site boundaries from OpenStreetMap. Done before "nearby" so a society found there by name is measured from its outline.
+    matched = []
+    for s in societies:
+        area = match_area(s, area_grid, cfg.get("inside_only_max_m2", 250_000))
+        if area and s.get("loc_shared") and not tokens(s["name"]) & tokens(area["properties"]["name"]):
+            area = None  # the pin is the locality's centre: falling inside an area there says nothing about this site
+        if area and area["properties"]["osm"] in used_areas:
+            area = None  # another society already owns this boundary
+        if area:
+            used_areas.add(area["properties"]["osm"])
+            s["osm_area"] = area["properties"]["osm"]
+            if s.get("loc_shared"):  # found by name in OpenStreetMap: draw and label it there, off the shared pin
+                s["at"] = [round(v, 6) for v in geo.centroid(area["geometry"]["coordinates"][0])]
+        matched.append(area)
+    spread_shared_points([s for s in societies if s.get("loc_shared") and not s.get("osm_area")])
+
     # nearby places from OpenStreetMap
     pois_file = out / "osm_pois.json"
     pois = json.loads(pois_file.read_text()) if pois_file.exists() else []
     poi_grid = Grid(pois, lambda q: (q["lng"], q["lat"]))
     for s in societies:
-        here = (s["lng"], s["lat"])
+        # a shared locality pin is not this society's place: measure from its OpenStreetMap outline when it has one.
+        # Without one the distances stay the pin's, and the filters treat them as not known (filters.js nearbyKnown).
+        here = tuple(s["at"]) if s.get("loc_shared") and s.get("osm_area") else (s["lng"], s["lat"])
         near = {}
         for q in poi_grid.near(here, r=3):
             d = geo.dist_m(here, (q["lng"], q["lat"]))
@@ -387,20 +512,8 @@ def main(city="gurgaon"):
                 near[k]["n"] = near[k].get("n", 0) + 1
         s["nearby"] = near
 
-    # Flat Finder score (0-10): residents' rating, what is nearby, amenities. Shown with its parts.
     for s in societies:
-        parts = {}
-        if s.get("rating"):
-            parts["residents"] = round(s["rating"] * 2, 1)
-        nb = s["nearby"]
-        reach = [nb.get("park", {}).get("m", 9e9) <= 500, nb.get("metro", {}).get("m", 9e9) <= 1500 or nb.get("rail", {}).get("m", 9e9) <= 1500,
-                 nb.get("school", {}).get("m", 9e9) <= 1000, nb.get("hospital", {}).get("m", 9e9) <= 2000, nb.get("shopping", {}).get("m", 9e9) <= 1500]
-        parts["nearby"] = round(10 * sum(reach) / len(reach), 1)
-        parts["amenities"] = round(min(10, len(s["amenities"]) / 3), 1)
-        w = {"residents": 0.5, "nearby": 0.3, "amenities": 0.2}
-        tot = sum(w[k] for k in parts)
-        s["score"] = round(sum(parts[k] * w[k] for k in parts) / tot, 1)
-        s["score_parts"] = parts
+        s["score"], s["score_parts"] = score(s)
 
     # prices: real listing medians first, then labelled estimates
     model = pricing.fit_yields(societies)
@@ -422,27 +535,27 @@ def main(city="gurgaon"):
             pricing.add_estimates(s, model, {b: statistics.median(v) for b, v in sizes.items()}, psf)
         s["prices"] = {str(b): v for b, v in sorted(s["prices"].items())}
 
-    for i, s in enumerate(societies):
-        area = match_area(s, area_grid)
-        if area and area["properties"]["osm"] in used_areas:
-            area = None  # another society already owns this boundary
-        if area:
-            used_areas.add(area["properties"]["osm"])
-            s["osm_area"] = area["properties"]["osm"]
+    for i, (s, area) in enumerate(zip(societies, matched)):
         f, shape = shapes_for(s, area, bld_grid, i)
         s["shape"] = shape
         shapes.extend(f)
-        events.extend(events_for(s))
+        events.extend(events_for(s, cfg["name"]))
 
     WEB.mkdir(parents=True, exist_ok=True)
+    sources = ["Magicbricks project pages", "OpenStreetMap contributors"]
+    if cfg.get("rera") and hr_file.exists():
+        sources.append(cfg["rera"])
+    if ver:
+        sources.append("Builder brochures (verified rows)")
     doc = {"city": {"id": city, "name": cfg["name"], "center": cfg["center"], "zoom": cfg["zoom"]},
             "price_model": model,
             "room_model": room_model,
             "counts": {"listed": len(raw), "on_map": len(societies), "not_located": not_located,
                        "ai_read": sum(1 for s in societies if s.get("ai_read")),
                        "for_sale": sum(s["sale_count"] or 0 for s in societies), "for_rent": sum(s["rent_count"] or 0 for s in societies),
-                       "verified": sum(s["verified"] for s in societies)},
-            "sources": ["Magicbricks project pages", "OpenStreetMap contributors", "HRERA Gurugram", "Builder brochures (verified rows)"],
+                       "verified": sum(s["verified"] for s in societies), "stubs_dropped": stubs_dropped,
+                       "approx_location": approx_location},
+            "sources": sources,
             "societies": societies, "events": events}
     details = {}
     for s in societies:  # heavy per-society text, loaded only when a card opens
@@ -457,11 +570,15 @@ def main(city="gurgaon"):
         if "h" in f["properties"]:
             f["properties"]["h"] = round(f["properties"]["h"])
     (WEB / f"{city}-shapes.geojson").write_text(json.dumps({"type": "FeatureCollection", "features": shapes}, separators=(",", ":")))
-    from collections import Counter
-    built = sorted(p.stem for p in WEB.glob("*.json") if p.stem != "cities")
     all_cfg = json.loads((ROOT.parent / "data" / "cities.json").read_text())
-    (WEB / "cities.json").write_text(json.dumps({c: {"name": all_cfg[c]["name"]} for c in built if c in all_cfg}))
+    # every built city, the default one first: the web app opens the first default it finds
+    built = sorted((p.stem for p in WEB.glob("*.json") if p.stem in all_cfg), key=lambda c: (not all_cfg[c].get("default"), c))
+    (WEB / "cities.json").write_text(json.dumps(
+        {c: {"name": all_cfg[c]["name"], **({"default": True} if all_cfg[c].get("default") else {})} for c in built}))
     print(doc["counts"], Counter(s["shape"] for s in societies), Counter(s["kind"] for s in societies), "features", len(shapes))
+    for f in sorted(WEB.glob(f"{city}*")):
+        mb = f.stat().st_size / 2 ** 20
+        print(f"{f.name}: {mb:.1f} MiB" + ("  (over the 25 MiB Cloudflare Pages file limit)" if mb > 25 else ""))
 
 
 def write_csv(soc_path, unit_path, societies):
@@ -500,4 +617,6 @@ def write_csv(soc_path, unit_path, societies):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1] if len(sys.argv) > 1 else "gurgaon")
+    if len(sys.argv) < 2:  # no default: a bare run must never overwrite another city's built data
+        sys.exit("usage: python build_city.py <city>")
+    main(sys.argv[1])

@@ -1,6 +1,8 @@
 pipeline/cache/
 pipeline/cache_*.log
 pipeline/out/*/osm_buildings.geojson
+pipeline/out/bangalore/mb_projects.json
+pipeline/out/bangalore/mb_index.json
 node_modules/
 web/dist/
 .DS_Store

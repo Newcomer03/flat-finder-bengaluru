@@ -138,3 +138,30 @@ describe('flagged prices', () => {
     expect(priceFor(s, 'rent', [3])).toMatchObject({ value: 90100, estimated: true });
   });
 });
+
+describe('approximate locations', () => {
+  // the portal pins some projects at the centre of their locality: their nearby distances are that pin's, not theirs
+  const nearby = { park: { m: 100 }, metro: { m: 4000 } };
+  const pinned = soc({ loc_shared: 246, nearby, unit_types: [{ bhk: 3, size_sqft: 1500 }] });
+
+  it('a nearby filter leaves a locality-pinned society unchecked: neither a match nor a fail', () => {
+    expect(matchSociety(pinned, crit({ near: ['park'] }))).toBe('unknown'); // the pin is near a park; the site may not be
+    expect(matchSociety(pinned, crit({ near: ['metro'] }))).toBe('unknown'); // the pin is far from the metro; the site may be near
+    expect(matchSociety(pinned, crit({ near: ['park'], bhk: [3] }))).toBe('unknown');
+  });
+  it('filters that can be checked still decide it', () => {
+    expect(matchSociety(pinned, crit())).toBe('match'); // no nearby filter: nothing unchecked
+    expect(matchSociety(pinned, crit({ near: ['park'], bhk: [2] }))).toBe('no');
+    expect(matchSociety(pinned, crit({ near: ['park'], kinds: ['villa'] }))).toBe('no');
+    expect(matchSociety(pinned, crit({ near: ['park'], amenities: ['pool'] }))).toBe('no');
+  });
+  it('one found by name in OpenStreetMap has a place of its own and is checked as usual', async () => {
+    const { nearbyKnown } = await import('./filters.js');
+    const found = { ...pinned, osm_area: 'way/1' };
+    expect(nearbyKnown(pinned)).toBe(false);
+    expect(nearbyKnown(found)).toBe(true);
+    expect(nearbyKnown(soc({ nearby }))).toBe(true);
+    expect(matchSociety(found, crit({ near: ['park'] }))).toBe('match');
+    expect(matchSociety(found, crit({ near: ['metro'] }))).toBe('no');
+  });
+});

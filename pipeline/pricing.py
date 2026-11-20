@@ -98,10 +98,15 @@ def flag_outliers(societies):
                 psf[(s.get("locality"),)].append(p["psf"])
                 psf[(None,)].append(p["psf"])
 
+    med = {}  # medians are asked for once per price cell: sort each peer list once, not every time
+
     def typical(table, loc, *key):
         for where, k in ((loc, (loc, *key)), ("the city", (None, *key))):
             if len(table[k]) >= MIN_PEERS:
-                return statistics.median(table[k]), where
+                mk = (id(table), k)
+                if mk not in med:
+                    med[mk] = statistics.median(table[k])
+                return med[mk], where
         return None, None
 
     def backed(s, p, kind, value):

@@ -52,6 +52,7 @@ def load_verified(path=FILE):
             "name": s["name"],
             "match": s.get("match", [s["name"]]),
             "sector": s.get("sector"),
+            "locality": s.get("locality"),
             "note": s.get("note"),
             "amen_facts": s.get("amenities", {}),
             "unit_types": [unit_from_verified(u) for u in s.get("unit_types", [])],

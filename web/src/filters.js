@@ -1,4 +1,5 @@
 // Pure filter logic. A society is "match", "likely", "unknown" (not checked yet) or "no".
+// "unknown" means a filter could not be checked: no room sizes read, no unit sizes listed, or no location of its own.
 
 export const RANK = { match: 4, likely: 3, probable: 2, unknown: 1, no: 0 };
 
@@ -42,6 +43,11 @@ export const NEAR = {
   hospital: { label: 'Hospital', kinds: ['hospital'], m: 2000 },
   shopping: { label: 'Mall or supermarket', kinds: ['shopping'], m: 1500 },
 };
+
+// The portal pins some projects at the centre of their locality (loc_shared: how many share that pin). Unless
+// OpenStreetMap has the society by name (osm_area), it has no place of its own, so its nearby distances are the
+// pin's and can neither pass nor fail a nearby filter.
+export const nearbyKnown = (s) => !s.loc_shared || !!s.osm_area;
 
 export function isNear(s, key) {
   const n = NEAR[key];
@@ -123,7 +129,8 @@ export function matchSociety(s, c) {
     if (!norm(c.q).split(' ').every((w) => hay.includes(w))) return 'no';
   }
   if (c.kinds.length && !c.kinds.includes(s.kind)) return 'no';
-  for (const key of c.near || []) if (!isNear(s, key)) return 'no';
+  const nearUnchecked = (c.near || []).length > 0 && !nearbyKnown(s); // caps the verdict at "unknown" below
+  if (!nearUnchecked) for (const key of c.near || []) if (!isNear(s, key)) return 'no';
   if (c.ready && !/ready/i.test(s.status || '')) return 'no';
   const budget = c.mode === 'rent' ? c.maxRent : c.maxPrice;
   const floor = c.mode === 'rent' ? c.minRent : c.minPrice;
@@ -135,7 +142,7 @@ export function matchSociety(s, c) {
   for (const key of c.amenities) if (!hasAmenity(s, key)) return 'no';
 
   const unitFilters = c.bhk.length || c.minSqft > 0 || c.maxSqft || c.room || c.roomArea;
-  if (!unitFilters) return 'match';
+  if (!unitFilters) return nearUnchecked ? 'unknown' : 'match';
   const units = s.unit_types.filter((u) => !c.bhk.length || c.bhk.includes(u.bhk));
   if (!units.length) return s.unit_types.length ? 'no' : 'unknown';
   let best = 'no';
@@ -144,7 +151,7 @@ export function matchSociety(s, c) {
     if (RANK[r] > RANK[best]) best = r;
     if (best === 'match') break;
   }
-  return best;
+  return nearUnchecked && RANK[best] > RANK.unknown ? 'unknown' : best;
 }
 
 export function feetLabel(ft) {

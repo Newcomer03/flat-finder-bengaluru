@@ -4,13 +4,13 @@ import { readFile, realpath } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { DEFAULT_CRITERIA, feetLabel, formatINR, matchSociety, priceFor } from '../web/src/filters.js';
 
-const SITE = 'https://flat-finder.pages.dev';
+const SITE = process.env.FLATFINDER_SITE || 'http://localhost:5173'; // where the links point, and where data comes from when there is no local build
 
 const HELP = `flatfinder: find housing societies that fit
 
   npx github:kairothq/flat-finder [options]
 
-  --city <id>            gurgaon (default), more as they are added
+  --city <id>            bangalore (default) or gurgaon
   --bhk 3,4              BHK types
   --min-bedroom 11'3x12'3   every bedroom must clear both sides (also 11.25x12.25)
   --min-sqft 1620        minimum unit size (super area where known)
@@ -23,7 +23,7 @@ const HELP = `flatfinder: find housing societies that fit
   --likely               also show "likely" (rooms read so far pass)
   --limit 30             rows to print
   --json                 print JSON
-  --data <file>          use a local <city>.json instead of the website
+  --data <file>          use this <city>.json instead of the local build
 `;
 
 export function parseFeet(s) {
@@ -40,7 +40,7 @@ export function parsePrice(s) {
 }
 
 export function parseArgs(argv) {
-  const o = { city: 'gurgaon', crit: structuredClone(DEFAULT_CRITERIA), limit: 30, json: false, likely: false, data: null };
+  const o = { city: 'bangalore', crit: structuredClone(DEFAULT_CRITERIA), limit: 30, json: false, likely: false, data: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i], v = () => argv[++i];
     if (a === '--city') o.city = v();
@@ -80,10 +80,19 @@ function smallestRoom(s) {
 
 const money = (p, mode) => (p ? `${p.estimated ? '~' : ''}${formatINR(p.value)}${mode === 'rent' ? '/mo' : ''}` : '');
 
+async function load(o) {
+  if (o.data) return JSON.parse(await readFile(o.data, 'utf8'));
+  try { // the local build, when this city has been built
+    return JSON.parse(await readFile(new URL(`../web/public/data/${o.city}.json`, import.meta.url), 'utf8'));
+  } catch {
+    return (await fetch(`${SITE}/data/${o.city}.json`)).json();
+  }
+}
+
 async function main() {
   const o = parseArgs(process.argv.slice(2));
   if (o.help) return console.log(HELP);
-  const city = o.data ? JSON.parse(await readFile(o.data, 'utf8')) : await (await fetch(`${SITE}/data/${o.city}.json`)).json();
+  const city = await load(o);
   const rows = search(city, o);
   if (o.json) return console.log(JSON.stringify(rows.slice(0, o.limit).map(({ s, v }) => ({ verdict: v, ...s })), null, 2));
   console.log(`${rows.length} societies in ${city.city.name}${o.likely ? ' (including likely)' : ''}\n`);
@@ -93,7 +102,7 @@ async function main() {
   }));
   console.table(table);
   console.log('~ = our estimate from the rent-to-price ratio, not a listing.');
-  console.log('* verified from brochures or HRERA plans. Unit rows without room sizes are "not checked yet" and never shown as matches.');
+  console.log('* verified from builder plans or RERA filings. Unit rows without room sizes are "not checked yet" and never shown as matches.');
 }
 
 const self = fileURLToPath(import.meta.url);

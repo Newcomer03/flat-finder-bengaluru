@@ -3,7 +3,7 @@ import maplibregl from 'maplibre-gl';
 import { addBaseLayers, addSocietyLayers, BASE_MODES, createMap, OVERVIEW, setBaseMode, setHighlights, setSelected, setStates, startPulse } from './map.js';
 import { searchSocieties } from './search.js';
 import { createFeed } from './feed.js';
-import { AMENITY_KEYS, DEFAULT_CRITERIA, NEAR, RANK, feetLabel, formatINR, matchSociety, matchUnit, priceFor, roomPasses } from './filters.js';
+import { AMENITY_KEYS, DEFAULT_CRITERIA, NEAR, RANK, feetLabel, formatINR, matchSociety, matchUnit, nearbyKnown, priceFor, roomPasses } from './filters.js';
 
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
@@ -24,18 +24,28 @@ const KINDS = [
 const AMEN_LABELS = { squash: 'Squash', pool: 'Pool', gym: 'Gym', club: 'Clubhouse', tennis: 'Tennis', badminton: 'Badminton', jogging: 'Jogging track', kids: 'Kids play' };
 const DIVY = { // Divy's own Gurugram search, shown as the example
   ...structuredClone(DEFAULT_CRITERIA), kinds: ['apartment'], bhk: [2, 3, 4], roomArea: 138, minSqft: 1620, amenities: ['squash'] }; // 11'3" x 12'3" = 138 sq ft
+const EXAMPLE = { // a neutral example search for cities without a hand-tuned one
+  ...structuredClone(DEFAULT_CRITERIA), kinds: ['apartment'], bhk: [2, 3], amenities: ['pool', 'gym'], near: ['metro'] };
+// What differs per city in the interface. Anything a city leaves out comes from UI_DEFAULT.
+const CITY_UI = {
+  gurgaon: { unit: 'gaj', preset: DIVY, presetLabel: "Load Divy's search", paste: 'Heritage One\nPioneer Araya\nDLF Camellias', search: 'Search a society, developer or sector', requests: true },
+  bangalore: { paste: 'Prestige Shantiniketan\nSobha Dream Acres\nBrigade Gateway' },
+};
+const UI_DEFAULT = { unit: 'sqft', preset: EXAMPLE, presetLabel: 'Try an example', paste: '', search: 'Search a society, developer or area', requests: false };
 const STATE_LABEL = { match: 'Matches your search', likely: 'Likely match', probable: 'Probably fits (estimated)', unknown: 'Not checked yet', no: 'Does not match' };
 
 let crit = structuredClone(DEFAULT_CRITERIA);
 let baseMode = BASE_MODES.includes(params.get('map')) ? params.get('map') : 'streets';
-let roomMode = 'off', areaUnit = 'gaj', sortBy = 'best';
-let data, byId, map, feed, selected = null, states = new Map(), tourTimer = null, cityId = 'gurgaon', details = null;
+let roomMode = 'off', areaUnit = 'sqft', sortBy = 'best';
+let data, byId, map, feed, selected = null, states = new Map(), tourTimer = null, cityId = null, details = null;
+let ui = UI_DEFAULT, hasRooms = true; // hasRooms: this city has bedroom sizes read from plans, or a model to estimate them
 let myList = [], allAmenities = [];
 const highlights = { glow: true, bounds: true, labels: true, ...store.get('ff-highlights', {}) };
 
 async function boot() {
   const cities = await fetch('/data/cities.json').then((r) => r.json()).catch(() => ({ gurgaon: { name: 'Gurugram' } }));
-  cityId = cities[params.get('city')] ? params.get('city') : 'gurgaon';
+  const ids = Object.keys(cities); // ?city= if it is built, else the city flagged default, else the first one built
+  cityId = cities[params.get('city')] ? params.get('city') : ids.find((id) => cities[id].default) || ids[0];
   const [city, shapes] = await Promise.all([
     fetch(`/data/${cityId}.json`).then((r) => r.json()),
     fetch(`/data/${cityId}-shapes.geojson`).then((r) => r.json()),
@@ -44,6 +54,13 @@ async function boot() {
   OVERVIEW.center = city.city.center;
   OVERVIEW.zoom = city.city.zoom || OVERVIEW.zoom;
   byId = new Map(city.societies.map((s) => [s.id, s]));
+  ui = { ...UI_DEFAULT, ...CITY_UI[cityId] };
+  areaUnit = ui.unit;
+  hasRooms = !!city.room_model || city.counts.verified > 0 || city.counts.ai_read > 0;
+  $('sec-room').hidden = !hasRooms; // no bedroom sizes read for this city yet: do not offer a filter nothing can pass
+  $('preset-divy').textContent = ui.presetLabel;
+  $('paste-text').placeholder = ui.paste;
+  $('q').placeholder = ui.search;
   $('city-pick').replaceChildren(...Object.entries(cities).map(([id, c]) => new Option(c.name, id, false, id === cityId)));
   $('city-pick').onchange = () => { location.search = `?city=${$('city-pick').value}`; };
 
@@ -53,8 +70,8 @@ async function boot() {
 
   myList = params.get('list') ? params.get('list').split(',').filter((id) => byId.has(id)) : store.get(`ff-list-${cityId}`, []).filter((id) => byId.has(id));
   const c = city.counts, m = city.price_model || {}, rated = city.societies.filter((s) => s.rating).length;
-  $('note').textContent = `${c.on_map.toLocaleString()} societies · ${(c.for_sale || 0).toLocaleString()} homes for sale, ${(c.for_rent || 0).toLocaleString()} for rent on Magicbricks · ${c.verified} verified from brochures and HRERA plans`;
-  $('about-prices').innerHTML = `Prices and rents are medians of live Magicbricks listings. <b>⚠</b> marks a listing price our checks think is a typo (far from the same home nearby, or rent and price that cannot both be right): it is shown as listed but not used for filters. <b>~</b> marks our estimate: rent is about ${((m.city_yield || 0.025) * 100).toFixed(1)}% of the price per year here (measured on ${m.pairs || 0} society and BHK pairs, correlation ${m.log_price_rent_correlation ?? 'n/a'}). "Probably fits" uses a cautious bedroom size estimated from unit size (${city.room_model?.n || 0} verified unit types). Resident ratings exist for ${rated.toLocaleString()} societies.`;
+  $('note').textContent = `${c.on_map.toLocaleString()} societies · ${(c.for_sale || 0).toLocaleString()} homes for sale, ${(c.for_rent || 0).toLocaleString()} for rent on Magicbricks${c.verified ? ` · ${c.verified} verified from builder plans` : ''}`;
+  $('about-prices').innerHTML = `Prices and rents are medians of live Magicbricks listings. <b>⚠</b> marks a listing price our checks think is a typo (far from the same home nearby, or rent and price that cannot both be right): it is shown as listed but not used for filters. <b>~</b> marks our estimate: rent is about ${((m.city_yield || 0.025) * 100).toFixed(1)}% of the price per year here (measured on ${m.pairs || 0} society and BHK pairs, correlation ${m.log_price_rent_correlation ?? 'n/a'}). ${city.room_model ? `"Probably fits" uses a cautious bedroom size estimated from unit size (${city.room_model.n} verified unit types).` : hasRooms ? '' : 'Bedroom sizes have not been read for this city yet.'} Resident ratings exist for ${rated.toLocaleString()} societies. Based on <a href="${REPO}" target="_blank" rel="noopener">Flat Finder by kairothq</a>.`;
   $('dl-all').href = `/data/${cityId}-societies.csv`;
   $('dl-units').href = `/data/${cityId}-units.csv`;
   $('dl-results').onclick = exportResults;
@@ -77,7 +94,7 @@ async function boot() {
     return;
   }
   const points = { type: 'FeatureCollection', features: city.societies.map((s) => ({
-    type: 'Feature', properties: { sid: s.id, name: s.name, show: 1 }, geometry: { type: 'Point', coordinates: [s.lng, s.lat] } })) };
+    type: 'Feature', properties: { sid: s.id, name: s.name, show: 1 }, geometry: { type: 'Point', coordinates: at(s) } })) };
   map.once('style.load', () => {
     addSocietyLayers(map, shapes, points);
     addBaseLayers(map);
@@ -97,7 +114,7 @@ async function boot() {
 
 function intro() {
   closeCard();
-  if (params.get('preset') === 'divy') useCriteria(DIVY);
+  if (params.has('preset')) useCriteria(ui.preset);
   if (params.get('open')) {
     map.jumpTo(OVERVIEW);
     applyFilters();
@@ -178,7 +195,7 @@ function buildFilters() {
       return l;
     }));
   };
-  sizeSlider = dualRange($('f-size'), { min: 0, max: 8000, step: 50, fmt: (v, end) => (end === 'hi' && v >= 8000 ? 'Any' : `${v.toLocaleString()} sq ft · ${Math.round(v / 9)} gaj`),
+  sizeSlider = dualRange($('f-size'), { min: 0, max: 8000, step: 50, fmt: (v, end) => (end === 'hi' && v >= 8000 ? 'Any' : `${v.toLocaleString()} sq ft` + (ui.unit === 'gaj' ? ` · ${Math.round(v / 9)} gaj` : '')),
     onChange: (a, b) => { crit.minSqft = a; crit.maxSqft = b >= 8000 ? null : b; labels(); applyFilters(); } });
   priceSlider = dualRange($('f-price'), { min: 0, max: 20, step: 0.25, fmt: (v) => v, onChange: (a, b) => {
     const top = priceSlider.cfg.max, unit = crit.mode === 'rent' ? 1000 : 1e7;
@@ -238,7 +255,7 @@ function buildFilters() {
   $('amen-q').oninput = amenList;
   $('f-ready').onchange = () => { crit.ready = $('f-ready').checked; applyFilters(); };
   $('f-sort').onchange = () => { sortBy = $('f-sort').value; renderResults(); };
-  $('preset-divy').onclick = () => useCriteria(DIVY);
+  $('preset-divy').onclick = () => useCriteria(ui.preset);
   $('btn-replay').onclick = intro;
   $('btn-tour').onclick = tour;
   $('btn-hide').onclick = () => document.body.classList.toggle('bare');
@@ -270,7 +287,9 @@ function applyFilters(wave = false) {
   renderResults();
   if (selected) renderCard(byId.get(selected));
 }
-const dist = (s, c) => (s.lng - c[0]) ** 2 + (s.lat - c[1]) ** 2;
+// where a society is drawn: its own pin, or the stand-in spot the build gives one stacked on a shared locality pin
+const at = (s) => s.at || [s.lng, s.lat];
+const dist = (s, c) => (at(s)[0] - c[0]) ** 2 + (at(s)[1] - c[1]) ** 2;
 
 function sorted(list) {
   const price = (s) => priceFor(s, crit.mode, crit.bhk)?.value ?? Infinity;
@@ -296,7 +315,10 @@ function renderResults() {
   const rooms = crit.room || crit.roomArea;
   const bits = [];
   if (rooms) bits.push(`${counts.match} verified`, `${counts.likely} likely`, `${counts.probable} probably fit`);
-  if (counts.unknown) bits.push(`${counts.unknown.toLocaleString()} not checked yet`);
+  // "unknown" has three causes: under a nearby filter, no location of its own; with a room filter, plans unread; otherwise no unit sizes listed
+  const noPlace = crit.near.length ? data.societies.reduce((n, s) => n + (states.get(s.id) === 'unknown' && !nearbyKnown(s)), 0) : 0;
+  if (noPlace) bits.push(`${noPlace.toLocaleString()} with only an approximate location`);
+  if (counts.unknown > noPlace) bits.push(`${(counts.unknown - noPlace).toLocaleString()} ${rooms ? 'not checked yet' : 'with no unit sizes listed'}`);
   $('count-sub').textContent = bits.join(' · ');
   $('v-list').textContent = myList.length ? `${myList.length} saved` : 'empty';
   const groups = rooms
@@ -346,7 +368,7 @@ function openSociety(sid, { fly = true } = {}) {
   if (!s) return;
   if (map) setSelected(map, sid, selected);
   selected = sid;
-  if (fly && map) map.flyTo({ center: [s.lng, s.lat], zoom: mobile ? 15.4 : 16.2, pitch: is3d ? 55 : 0, bearing: 0, duration: 2600, essential: true,
+  if (fly && map) map.flyTo({ center: at(s), zoom: mobile ? 15.4 : 16.2, pitch: is3d ? 55 : 0, bearing: 0, duration: 2600, essential: true,
     offset: mobile ? [0, -80] : [-180, 0] });
   document.body.classList.add('has-card');
   if (mobile) showMobile('society');
@@ -398,11 +420,19 @@ function renderCard(s) {
   const counts = (s.sale_count || s.rent_count) ? `${(s.sale_count || 0).toLocaleString()} for sale · ${(s.rent_count || 0).toLocaleString()} for rent now` : 'No live listings';
   const parts = s.score_parts || {};
   const score = s.score != null ? `<div class="score"><div class="big">${s.score}<small>/10</small></div><div class="parts">
-      ${parts.residents != null ? `<span>Residents <b>${parts.residents}</b></span>` : '<span class="fine">No resident ratings yet</span>'}<span>Nearby <b>${parts.nearby}</b></span><span>Amenities <b>${parts.amenities}</b></span>
-      <span class="fine">Flat Finder score: residents' rating 50%, what is nearby 30%, amenities 20%</span></div></div>` : '';
+      ${parts.residents != null ? `<span>Residents <b>${parts.residents}</b></span>` : '<span class="fine">No resident ratings yet</span>'}${parts.nearby != null ? `<span>Nearby <b>${parts.nearby}</b></span>` : ''}<span>Amenities <b>${parts.amenities}</b></span>
+      <span class="fine">${parts.nearby != null ? "Flat Finder score: residents' rating 50%, what is nearby 30%, amenities 20%"
+    : "Flat Finder score: residents' rating and amenities only. What is nearby is left out because the location is approximate."}</span></div></div>` : '';
   const near = s.nearby || {};
   const nearRows = [['park', 'Park'], ['metro', 'Metro'], ['rail', 'Rail station'], ['school', 'School'], ['hospital', 'Hospital'], ['shopping', 'Mall or supermarket']]
     .filter(([k]) => near[k]).map(([k, l]) => `<div><span>${l}</span><b>${metres(near[k].m)}</b><small>${esc(near[k].name || '')}${near[k].n > 1 ? ` · ${near[k].n} within 1 km` : ''}</small></div>`).join('');
+  // the portal pins some projects at the centre of their locality: say so, and send Directions to the name instead of the pin
+  const where = `Magicbricks gives ${s.loc_shared} projects one shared pin, the centre of ${esc(s.locality || 'the locality')}`;
+  const approx = !s.loc_shared ? '' : s.osm_area
+    ? `<div class="fine">${where}. This one was found by name in OpenStreetMap, so it is drawn there and the distances below are measured from that outline.</div>`
+    : `<div class="fine">Approximate location. ${where}. Its spot on the map is a stand-in beside that pin so it can be clicked, and the distances below are from the pin, not from the site, so nearby filters leave it unchecked.</div>`;
+  const whyUnchecked = st === 'unknown' && crit.near.length && !nearbyKnown(s) ? '<div class="fine">Not checked: a nearby filter is on, and this project has only the centre of its locality as a location.</div>' : '';
+  const dest = s.loc_shared ? encodeURIComponent(new URL(s.gmaps).searchParams.get('query')) : `${s.lat},${s.lng}`;
   const ratingBars = d && Object.keys(d.ratings || {}).length ? `<div class="bars">${Object.entries(d.ratings).map(([k, v]) => `<div><span>${esc(k)}</span><i style="--w:${(v / 5) * 100}%"></i><b>${v}</b></div>`).join('')}</div>` : '';
   const reviews = d?.reviews?.length ? `<div class="reviews">${d.reviews.slice(0, 3).map((r) => `<blockquote>${esc(r.text)}<cite>${esc(r.by || 'Resident')}${r.date ? ' · ' + esc(r.date) : ''}</cite></blockquote>`).join('')}</div>` : '';
   const trend = d?.trend?.length > 1 ? sparkline(d.trend) : '';
@@ -414,6 +444,7 @@ function renderCard(s) {
       <div><span class="badge ${st}">${STATE_LABEL[st]}</span> ${s.verified ? '<span class="badge match">checked by hand</span>' : ''}${s.ai_read ? '<span class="badge likely">AI-read plans</span>' : ''}</div>
       <div class="row-gap"><button class="iconbtn star ${inList ? 'on' : ''}" id="c-star" title="${inList ? 'Remove from my list' : 'Add to my list'}">${inList ? '★' : '☆'}</button><button class="iconbtn" id="c-close" aria-label="Close">×</button></div>
     </div>
+    ${whyUnchecked}
     ${photos}
     <h2>${esc(s.name)}</h2>
     <div class="meta">${esc(s.developer || '')}${s.locality ? ' · ' + esc(s.locality) : ''} · ${esc(s.config_text || s.kind)}${s.kind_inferred ? ' <span class="fine">(type inferred from name)</span>' : ''}</div>
@@ -426,17 +457,17 @@ function renderCard(s) {
     ${trend}
     <h4>Bedrooms</h4>
     ${unitRows ? `<table><tr><th>Unit</th><th>Bedrooms</th><th></th><th>Source</th></tr>${unitRows}</table>` : '<div class="fine">No unit types listed.</div>'}
-    ${nearRows ? `<h4>Nearby</h4><div class="near">${nearRows}</div>` : ''}
+    ${nearRows ? `<h4>Nearby</h4>${approx}<div class="near">${nearRows}</div>` : approx}
     ${ratingBars ? `<h4>What residents rate</h4>${ratingBars}` : ''}${reviews}
     ${facts || amen ? `<h4>Amenities (${s.amenities.length})</h4><div class="amen">${facts}${amen}</div>` : ''}
     ${about}
     <div class="links">
       <a class="btnlink" href="${esc(s.gmaps)}" target="_blank" rel="noopener">Google Maps and reviews</a>
-      <a class="btnlink" href="https://www.google.com/maps/dir/?api=1&destination=${s.lat},${s.lng}" target="_blank" rel="noopener">Directions</a>
+      <a class="btnlink" href="https://www.google.com/maps/dir/?api=1&destination=${dest}" target="_blank" rel="noopener">Directions</a>
       <a href="${esc(s.url)}" target="_blank" rel="noopener">Magicbricks page</a>
       ${s.brochure_url ? `<a href="${esc(s.brochure_url)}" target="_blank" rel="noopener">Brochure</a>` : ''}
       ${plans}
-      ${!s.verified ? `<a href="${esc(issue)}" target="_blank" rel="noopener">Request a room check →</a>` : ''}
+      ${!s.verified && ui.requests ? `<a href="${esc(issue)}" target="_blank" rel="noopener">Request a room check →</a>` : ''}
     </div>
     <div class="fine">${s.rera_id ? 'RERA ' + esc(s.rera_id) + ' · ' : ''}${s.shape === 'osm' ? 'Buildings from OpenStreetMap' : s.shape === 'osm-site' ? 'Boundary from OpenStreetMap, towers drawn approximately' : 'Approximate shape: towers drawn from the listed tower count'}</div>`;
   $('card').hidden = false;
@@ -518,7 +549,7 @@ function buildList() {
     $('paste-result').innerHTML = `${found.length ? `<b>Added ${found.length}:</b> ${found.map(esc).join(' · ')}` : ''}${missed.length ? `<br><b>Not found:</b> ${missed.map(esc).join(', ')}` : ''}`;
     if (map && myList.length) {
       const pts = myList.map((id) => byId.get(id));
-      const b = pts.reduce((bb, s) => bb.extend([s.lng, s.lat]), new maplibregl.LngLatBounds([pts[0].lng, pts[0].lat], [pts[0].lng, pts[0].lat]));
+      const b = pts.reduce((bb, s) => bb.extend(at(s)), new maplibregl.LngLatBounds(at(pts[0]), at(pts[0])));
       map.fitBounds(b, { padding: { top: 80, bottom: 80, left: mobile ? 40 : 380, right: mobile ? 40 : 460 }, maxZoom: 15, bearing: 0 });
     }
   };
@@ -602,8 +633,12 @@ function buildOnboarding() {
   const c = data.counts;
   const steps = [
     ['Every society in ' + data.city.name + ', on one map', `${c.on_map.toLocaleString()} housing societies, ${(c.for_sale || 0).toLocaleString()} homes for sale and ${(c.for_rent || 0).toLocaleString()} for rent. Each one has its prices, rents, resident ratings, what is nearby, and links to Google Maps.`],
-    ['Start with what you cannot live without', 'Pick Buy or Rent and your budget. Then set the smallest bedroom you can live with, by both sides or by area in gaj or sq ft. Add amenities and what you want nearby, like a park within 500 m.'],
-    ['How to read the map', '<span class="lg match"></span> Verified: every bedroom read from builder plans and passes.<br><span class="lg likely"></span> Likely: the rooms read so far pass.<br><span class="lg probable"></span> Probably fits: plans not read yet, estimated from unit size.<br><span class="lg unknown"></span> Not checked yet: no room data, so neither pass nor fail.'],
+    ['Start with what you cannot live without', hasRooms
+      ? 'Pick Buy or Rent and your budget. Then set the smallest bedroom you can live with, by both sides or by area in gaj or sq ft. Add amenities and what you want nearby, like a park within 500 m.'
+      : 'Pick Buy or Rent and your budget. Choose BHK and home size, then add amenities and what you want nearby, like a metro station within 1.5 km.'],
+    ['How to read the map', !hasRooms
+      ? '<span class="lg match"></span> Bright: matches your filters.<br><span class="lg unknown"></span> Faint: not checked. The portal lists no unit sizes for it, so BHK and home size filters cannot check it' + (c.approx_location ? ', or it has only an approximate location, so nearby filters cannot' : '') + '.<br>Dark: does not match.'
+      : '<span class="lg match"></span> Verified: every bedroom read from builder plans and passes.<br><span class="lg likely"></span> Likely: the rooms read so far pass.<br><span class="lg probable"></span> Probably fits: plans not read yet, estimated from unit size.<br><span class="lg unknown"></span> Not checked yet: no room data, so neither pass nor fail.'],
     ['Open a society, keep a list', 'Click any building for prices, bedrooms, ratings and the research behind every number. Star the ones you like, or paste a list of names you already have. Export your results as a CSV any time.'],
   ];
   let i = 0;
@@ -612,7 +647,7 @@ function buildOnboarding() {
     $('ob-body').innerHTML = `<h3>${steps[i][0]}</h3><p>${steps[i][1]}</p>${i === 1 ? '<button class="preset" id="ob-divy">Try an example search</button>' : ''}`;
     $('ob-back').hidden = i === 0;
     $('ob-next').textContent = i === steps.length - 1 ? 'Start exploring' : 'Next';
-    $('ob-divy')?.addEventListener('click', () => { useCriteria(DIVY); done(); });
+    $('ob-divy')?.addEventListener('click', () => { useCriteria(ui.preset); done(); });
   };
   const done = () => { $('onboard').hidden = true; store.set('ff-onboarded', true); };
   $('ob-next').onclick = () => (i === steps.length - 1 ? done() : (i++, show()));
@@ -683,7 +718,7 @@ function setQuery(q) {
   if (q && map) {
     const hits = data.societies.filter((s) => states.get(s.id) !== 'no');
     if (hits.length) {
-      const b = hits.reduce((bb, s) => bb.extend([s.lng, s.lat]), new maplibregl.LngLatBounds([hits[0].lng, hits[0].lat], [hits[0].lng, hits[0].lat]));
+      const b = hits.reduce((bb, s) => bb.extend(at(s)), new maplibregl.LngLatBounds(at(hits[0]), at(hits[0])));
       map.fitBounds(b, { padding: { top: 80, bottom: 80, left: mobile ? 40 : 380, right: mobile ? 40 : 460 }, maxZoom: 15, bearing: 0 });
     }
   }

@@ -4,6 +4,36 @@ Every housing society in a city on one night map. Set the smallest bedroom you c
 
 Gurugram is first: about 2,700 projects from Magicbricks, building outlines from OpenStreetMap, and a set of societies verified by reading builder brochures and HRERA plans.
 
+## Bengaluru edition
+
+This copy is adapted from [kairothq/flat-finder](https://github.com/kairothq/flat-finder) to build and open Bengaluru by default. Gurugram's built data is kept as a second city (`?city=gurgaon`). It runs locally; nothing here is deployed.
+
+What is different from the original:
+
+- **Bengaluru is about ten times bigger.** Magicbricks lists roughly 29,000 projects there, so the crawl takes hours, takes an optional limit for a pilot run, stops by itself if it starts being refused, and never caches a page that has no data in it.
+- **Buildings are fetched per society, not per city.** OpenStreetMap has over 800,000 buildings in the area; only those inside named areas near a crawled project are downloaded.
+- **Portal stubs are dropped.** Listings with no units, towers, price, rating or live listings are left out and counted (`stubs_dropped`). Set `"drop_stubs": false` in `data/cities.json` to keep them.
+- **Locality-level pins are labelled.** Magicbricks pins about a quarter of Bengaluru projects at the centre of their locality rather than at the site. When five or more projects share one exact pin, the card says "Approximate location" above the nearby distances, and Directions searches by name instead of using the pin (`approx_location` in the build counts). So each can still be clicked, the build draws them as small stand-in sites in a honeycomb around the pin (`at` in the data). That spot is a drawing aid only: `lat`, `lng`, the CSV and the nearby distances stay the portal's. Because those distances are the pin's, a nearby filter leaves these societies "not checked" (faint) instead of matching or failing them, on the site and in the MCP server. For the same reason their Flat Finder score leaves out the nearby part and is rescaled from the resident rating and amenities; with no ratings and no amenities listed there is no score at all. The few found by name in OpenStreetMap are drawn at their outline, measured from it, and filtered and scored as usual.
+- **Namma Metro is read from station tags**, not from "metro" appearing in a name.
+- **Bedroom sizes are not read yet** for Bengaluru, so the smallest-bedroom filter is hidden there. Prices, rents, amenities, nearby places, scores and ratings all work.
+
+```bash
+# data: the two crawl commands run for a long time, so start them yourself
+cd pipeline
+caffeinate -i python3 mb_crawl.py list bangalore 100        # pilot: first 100 list pages. Drop the number for the full city.
+caffeinate -i python3 mb_crawl.py projects bangalore 2000   # pilot: 2,000 projects. Drop the number for the full city.
+python3 osm_fetch.py bangalore
+python3 build_city.py bangalore                             # -> web/public/data/
+
+# site
+cd ../web && npm install && npm run dev
+
+# terminal search against the local build
+node ../cli/flatfinder.mjs --bhk 2,3 --max-rent 60k --amenity pool
+```
+
+Every script now needs the city named: a bare `python3 build_city.py` exits instead of rebuilding Gurugram.
+
 ## What the colours mean
 
 - **Bright**: matches your search.

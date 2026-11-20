@@ -1,5 +1,5 @@
 import { expect, it } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { parseArgs, parseFeet, parsePrice, search } from './flatfinder.mjs';
 
 it('reads feet and prices', () => {
@@ -21,4 +21,16 @@ it("Divy's search finds Araya and Presidia as matches", () => {
 it('reads monthly rent', () => {
   expect(parsePrice('80k')).toBe(80000);
   expect(parseArgs(['--max-rent', '80k']).crit).toMatchObject({ mode: 'rent', maxRent: 80000 });
+});
+
+it('opens Bengaluru unless told otherwise', () => {
+  expect(parseArgs([]).city).toBe('bangalore');
+  expect(parseArgs(['--city', 'gurgaon']).city).toBe('gurgaon');
+});
+
+const blr = new URL('../web/public/data/bangalore.json', import.meta.url);
+it.skipIf(!existsSync(blr))('the Bengaluru build answers a plain search', () => {
+  const city = JSON.parse(readFileSync(blr));
+  expect(city.city.name).toBe('Bengaluru');
+  expect(search(city, parseArgs(['--bhk', '2,3'])).length).toBeGreaterThan(0);
 });
