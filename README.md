@@ -6,7 +6,9 @@ Gurugram is first: about 2,700 projects from Magicbricks, building outlines from
 
 ## Bengaluru edition
 
-This copy is adapted from [kairothq/flat-finder](https://github.com/kairothq/flat-finder) to build and open Bengaluru by default. Gurugram's built data is kept as a second city (`?city=gurgaon`). It runs locally; nothing here is deployed.
+This copy is adapted from [kairothq/flat-finder](https://github.com/kairothq/flat-finder) to build and open Bengaluru by default. Gurugram's built data is kept as a second city (`?city=gurgaon`).
+
+It is published with GitHub Pages at https://newcomer03.github.io/flat-finder-bengaluru/. Every push to the `bengaluru` branch rebuilds `web/` and publishes it (`.github/workflows/pages.yml`); the built data in `web/public/data` is committed, so nothing is crawled there. The page asks search engines not to index it. Pages serves static files only, so the `/mcp` connector described below is not available on this copy; the map, filters, cards and CSV downloads are.
 
 What is different from the original:
 
